@@ -74,6 +74,8 @@ defmodule ReqLLM.Provider.Defaults do
 
   import ReqLLM.Provider.Utils, only: [maybe_put: 3, ensure_parsed_body: 1]
 
+  alias ReqLLM.Message.ContentPart
+
   require Logger
 
   @doc """
@@ -515,19 +517,33 @@ defmodule ReqLLM.Provider.Defaults do
     Enum.map(messages, &encode_openai_message/1)
   end
 
-  defp encode_openai_message(%ReqLLM.Message{role: r, content: c, tool_calls: tc}) do
-    base_message = %{
+  defp encode_openai_message(%ReqLLM.Message{role: r, content: c, tool_calls: tc} = message) do
+    tool_calls_from_content =
+      message
+      |> Map.get(:content, [])
+      |> Enum.filter(&(&1.type == :tool_call))
+      |> Enum.map(fn %ContentPart{tool_name: name, input: input, tool_call_id: id} ->
+        %{id: id, type: "function", function: %{name: name, arguments: Jason.encode!(input)}}
+      end)
+
+    tool_call_id_from_content =
+      message
+      |> Map.get(:content, [])
+      |> Enum.filter(&(&1.type == :tool_result))
+      |> Enum.find_value(fn %ContentPart{tool_call_id: id} -> id end)
+
+    # Add tool_calls if present and not nil
+    %{
       role: to_string(r),
       content: encode_openai_content(c)
     }
-
-    # Add tool_calls if present and not nil
-    case tc do
-      nil -> base_message
-      [] -> base_message
-      calls -> Map.put(base_message, :tool_calls, calls)
-    end
+    |> append_if_not_empty(:tool_calls, (tc || []) ++ tool_calls_from_content)
+    |> append_if_not_empty(:tool_call_id, tool_call_id_from_content)
   end
+
+  defp append_if_not_empty(message, _key, nil), do: message
+  defp append_if_not_empty(message, _key, []), do: message
+  defp append_if_not_empty(message, key, value), do: Map.put(message, key, value)
 
   defp encode_openai_content(content) when is_binary(content), do: content
 
@@ -538,60 +554,32 @@ defmodule ReqLLM.Provider.Defaults do
   end
 
   # Flatten single text content to a string for cleaner wire format
-  defp maybe_flatten_single_text([%{type: "text", text: text}]), do: text
-
   defp maybe_flatten_single_text(content) do
     # Filter out nil values first
     filtered = Enum.reject(content, &is_nil/1)
 
     case filtered do
       [%{type: "text", text: text}] -> text
-      _ -> filtered
+      [] -> ""
+      filtered -> filtered
     end
   end
 
-  defp encode_openai_content_part(%ReqLLM.Message.ContentPart{type: :text, text: text}) do
+  defp encode_openai_content_part(%ContentPart{type: :text, text: text}) do
     %{type: "text", text: text}
   end
 
-  defp encode_openai_content_part(%ReqLLM.Message.ContentPart{
-         type: :tool_call,
-         tool_name: name,
-         input: input,
-         tool_call_id: id
-       }) do
-    %{
-      id: id,
-      type: "function",
-      function: %{
-        name: name,
-        arguments: Jason.encode!(input)
-      }
-    }
+  defp encode_openai_content_part(%ContentPart{type: :image, data: data, media_type: media_type}) do
+    url = "data:#{media_type};base64,#{Base.encode64(data)}"
+    encode_openai_content_part(%ContentPart{type: :image_url, url: url})
   end
 
-  defp encode_openai_content_part(%ReqLLM.Message.ContentPart{
-         type: :image,
-         data: data,
-         media_type: media_type
-       }) do
-    base64 = Base.encode64(data)
-
-    %{
-      type: "image_url",
-      image_url: %{
-        url: "data:#{media_type};base64,#{base64}"
-      }
-    }
+  defp encode_openai_content_part(%ContentPart{type: :image_url, url: url}) do
+    %{type: "image_url", image_url: %{url: url}}
   end
 
-  defp encode_openai_content_part(%ReqLLM.Message.ContentPart{type: :image_url, url: url}) do
-    %{
-      type: "image_url",
-      image_url: %{
-        url: url
-      }
-    }
+  defp encode_openai_content_part(%ContentPart{type: :tool_result, output: output}) do
+    %{type: "text", text: Jason.encode!(output)}
   end
 
   defp encode_openai_content_part(_), do: nil
@@ -844,11 +832,11 @@ defmodule ReqLLM.Provider.Defaults do
   defp build_openai_message_from_chunks(_), do: nil
 
   defp openai_chunk_to_content_part(%ReqLLM.StreamChunk{type: :content, text: text}) do
-    %ReqLLM.Message.ContentPart{type: :text, text: text}
+    %ContentPart{type: :text, text: text}
   end
 
   defp openai_chunk_to_content_part(%ReqLLM.StreamChunk{type: :thinking, text: text}) do
-    %ReqLLM.Message.ContentPart{type: :thinking, text: text}
+    %ContentPart{type: :thinking, text: text}
   end
 
   defp openai_chunk_to_content_part(%ReqLLM.StreamChunk{
@@ -857,7 +845,7 @@ defmodule ReqLLM.Provider.Defaults do
          arguments: args,
          metadata: meta
        }) do
-    %ReqLLM.Message.ContentPart{
+    %ContentPart{
       type: :tool_call,
       tool_name: name,
       input: args,
@@ -1154,7 +1142,7 @@ defmodule ReqLLM.Provider.Defaults do
         text_content =
           content_parts
           |> Enum.find_value(fn
-            %ReqLLM.Message.ContentPart{type: :text, text: text} when is_binary(text) -> text
+            %ContentPart{type: :text, text: text} when is_binary(text) -> text
             _ -> nil
           end)
 

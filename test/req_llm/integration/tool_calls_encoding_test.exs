@@ -83,7 +83,7 @@ defmodule ReqLLM.Integration.ToolCallsEncodingTest do
       [_user, assistant_with_tools, _tool1, _tool2, _final_assistant] = result.messages
 
       assert assistant_with_tools.role == "assistant"
-      assert assistant_with_tools.content == []
+      assert assistant_with_tools.content == ""
       assert Map.has_key?(assistant_with_tools, :tool_calls)
       assert length(assistant_with_tools.tool_calls) == 2
 

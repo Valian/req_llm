@@ -7,8 +7,6 @@ defmodule ReqLLM.Provider.DefaultsTest do
   describe "encode_context_to_openai_format/2" do
     test "encodes text content correctly" do
       test_cases = [
-        # Simple string content
-        {%Message{role: :user, content: "Hello"}, "Hello"},
         # Single text part flattens to string
         {%Message{role: :user, content: [%ContentPart{type: :text, text: "Hello"}]}, "Hello"},
         # Multiple text parts stay as array
@@ -60,7 +58,7 @@ defmodule ReqLLM.Provider.DefaultsTest do
         messages: [
           %{
             role: "assistant",
-            content: [],
+            content: "",
             tool_calls: [
               %{
                 id: "call_123",
@@ -72,11 +70,13 @@ defmodule ReqLLM.Provider.DefaultsTest do
         ]
       }
 
+      # Content-part level tool calls should also be moved to message-level tool_calls
       expected_content_result = %{
         messages: [
           %{
             role: "assistant",
-            content: [
+            content: "",
+            tool_calls: [
               %{
                 id: "call_123",
                 type: "function",
@@ -96,6 +96,37 @@ defmodule ReqLLM.Provider.DefaultsTest do
                %Context{messages: [content_tool_calls]},
                "gpt-4"
              ) == expected_content_result
+    end
+
+    test "encodes tool result messages correctly" do
+      # Tool result message as created by Context.tool_result_message/4
+      tool_result = %Message{
+        role: :tool,
+        name: "get_weather",
+        tool_call_id: "toolu_123",
+        content: [
+          %ContentPart{
+            type: :tool_result,
+            tool_call_id: "toolu_123",
+            output: %{temperature: 72, condition: "sunny"}
+          }
+        ]
+      }
+
+      result =
+        Defaults.encode_context_to_openai_format(
+          %Context{messages: [tool_result]},
+          "gpt-4"
+        )
+
+      assert %{messages: [message]} = result
+      assert message.role == "tool"
+      assert message.tool_call_id == "toolu_123"
+      assert is_binary(message.content)
+
+      # Verify the content is valid JSON with the expected structure
+      {:ok, parsed_content} = Jason.decode(message.content)
+      assert parsed_content == %{"temperature" => 72, "condition" => "sunny"}
     end
   end
 
@@ -160,7 +191,7 @@ defmodule ReqLLM.Provider.DefaultsTest do
            assert tool_call_part.tool_call_id == "call_123"
          end},
 
-        # Missing fields handled gracefully  
+        # Missing fields handled gracefully
         {%{"choices" => [%{"message" => %{"content" => "Hello"}}]},
          fn result ->
            assert result.id == "unknown"

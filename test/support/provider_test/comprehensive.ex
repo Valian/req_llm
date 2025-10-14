@@ -2,15 +2,16 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
   @moduledoc """
   Comprehensive per-model provider tests.
 
-  Consolidates all provider capability testing into up to 8 focused tests per model:
+  Consolidates all provider capability testing into up to 9 focused tests per model:
   1. Basic generate_text (non-streaming)
   2. Streaming with system context + creative params
   3. Token limit constraints
   4. Usage metrics and cost calculations
   5. Tool calling - multi-tool selection
   6. Tool calling - no tool when inappropriate
-  7. Object generation (streaming) - only for models with :tool_call capability
-  8. Reasoning/thinking tokens - only for models with :reasoning capability
+  7. Tool calling - round-trip with tool result message - only for models with :tool_call capability
+  8. Object generation (streaming) - only for models with :tool_call capability
+  9. Reasoning/thinking tokens - only for models with :reasoning capability
 
   Tests use fixtures for fast, deterministic execution while supporting
   live API recording with REQ_LLM_FIXTURES_MODE=record.
@@ -311,6 +312,60 @@ defmodule ReqLLM.ProviderTest.Comprehensive do
                 fixture_opts("no_tool", base_opts ++ [tools: tools])
               )
               |> assert_basic_response()
+            end
+          end
+
+          if :tool_call in ReqLLM.capabilities(model_spec) do
+            @tag category: :tool_calling
+            test "tool calling - round-trip with tool result message" do
+              if debug?() do
+                IO.puts("\n[Comprehensive] model_spec=#{@model_spec}, test=tool_roundtrip")
+              end
+
+              tools = [
+                ReqLLM.tool(
+                  name: "get_weather",
+                  description: "Get current weather information for a location",
+                  parameter_schema: [
+                    location: [type: :string, required: true],
+                    unit: [type: {:in, ["celsius", "fahrenheit"]}]
+                  ],
+                  callback: fn _args -> {:ok, "Weather data"} end
+                )
+              ]
+
+              base_opts =
+                param_bundles().deterministic
+                |> Keyword.put(:max_tokens, tool_budget_for(@model_spec))
+                |> then(
+                  &reasoning_overlay(
+                    @model_spec,
+                    &1,
+                    tool_budget_for(@model_spec) * 2
+                  )
+                )
+
+              context =
+                ReqLLM.Context.new([
+                  system("You are a helpful assistant."),
+                  user("What's the weather like in San Francisco?"),
+                  assistant_tool_call("get_weather", %{location: "San Francisco"}, id: "call_123"),
+                  tool_result_message("get_weather", "call_123", %{
+                    temperature: 72,
+                    condition: "sunny",
+                    unit: "fahrenheit"
+                  })
+                ])
+
+              assert {:ok, result} =
+                       ReqLLM.generate_text(
+                         @model_spec,
+                         context,
+                         fixture_opts("tool_roundtrip", base_opts ++ [tools: tools])
+                       )
+
+              text = ReqLLM.Response.text(result)
+              assert String.length(text) > 0, "Expected text response when model skips tool use"
             end
           end
 
