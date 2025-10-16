@@ -419,7 +419,6 @@ defmodule ReqLLM.Providers.XAI do
       name =
         case tool do
           %{name: n} -> n
-          %ReqLLM.Tool{name: n} -> n
           _ -> nil
         end
 
