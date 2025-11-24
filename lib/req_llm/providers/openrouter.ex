@@ -352,19 +352,23 @@ defmodule ReqLLM.Providers.OpenRouter do
       200 ->
         body = ensure_parsed_body(resp.body)
 
-        if deepseek_model?(req) do
-          case extract_deepseek_tool_calls(body) do
-            {:ok, updated_body} ->
-              ReqLLM.Provider.Defaults.default_decode_response(
-                {req, %{resp | body: updated_body}}
-              )
+        # Extract reasoning_details BEFORE any transformations
+        reasoning_details = extract_reasoning_details(body)
 
-            :no_tool_calls ->
-              ReqLLM.Provider.Defaults.default_decode_response(args)
+        # Handle Deepseek tool calls extraction (may modify body)
+        body_with_tool_calls =
+          case extract_deepseek_tool_calls(body) do
+            {:ok, updated_body} -> updated_body
+            :no_tool_calls -> body
           end
-        else
-          ReqLLM.Provider.Defaults.default_decode_response(args)
-        end
+
+        # Decode using default decoder
+        {req, resp_with_decoded} = ReqLLM.Provider.Defaults.default_decode_response({req, %{resp | body: body_with_tool_calls}})
+
+        # Attach reasoning_details to the message if present
+        updated_resp = attach_reasoning_details_to_response(resp_with_decoded, reasoning_details)
+
+        {req, updated_resp}
 
       _ ->
         ReqLLM.Provider.Defaults.default_decode_response(args)
@@ -399,13 +403,6 @@ defmodule ReqLLM.Providers.OpenRouter do
 
   defp extract_deepseek_tool_calls(_), do: :no_tool_calls
 
-  defp deepseek_model?(req) do
-    case req.private[:req_llm_model] do
-      %LLMDB.Model{model: model} -> String.starts_with?(model, "deepseek/")
-      _ -> false
-    end
-  end
-
   defp parse_deepseek_tool_calls(reasoning) do
     ~r/<｜tool▁call▁begin｜>([^<]+)<｜tool▁sep｜>({[^}]+})<｜tool▁call▁end｜>/
     |> Regex.scan(reasoning, capture: :all_but_first)
@@ -427,6 +424,57 @@ defmodule ReqLLM.Providers.OpenRouter do
     |> String.replace(~r/<｜tool▁calls▁begin｜>.*<｜tool▁calls▁end｜>/s, "")
     |> String.trim()
   end
+
+  # Extract reasoning_details from OpenRouter response body
+  # Returns nil if not present or malformed
+  defp extract_reasoning_details(body) when is_map(body) do
+    with %{"choices" => [first_choice | _]} <- body,
+         %{"message" => %{"reasoning_details" => details}} when is_list(details) <- first_choice do
+      # Validate that it's a list of maps (defensive programming)
+      if Enum.all?(details, &is_map/1) do
+        details
+      else
+        nil
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  defp extract_reasoning_details(_), do: nil
+
+  # Attach reasoning_details to the message in the Req.Response
+  defp attach_reasoning_details_to_response(resp, nil), do: resp
+
+  defp attach_reasoning_details_to_response(%Req.Response{body: body} = resp, details) when is_struct(body, ReqLLM.Response) do
+    case body.message do
+      nil ->
+        resp
+
+      message ->
+        # Update the message with reasoning_details
+        updated_message = Map.put(message, :reasoning_details, details)
+
+        # Also update the first message in context.messages (which should be the same message)
+        # We need to update it so reasoning_details is preserved for multi-turn conversations
+        updated_context =
+          case body.context.messages do
+            [first | rest] when is_struct(first, ReqLLM.Message) and first.role == message.role ->
+              # Update the first message with reasoning_details
+              updated_first = Map.put(first, :reasoning_details, details)
+              %{body.context | messages: [updated_first | rest]}
+
+            _other ->
+              # If context is empty or doesn't match, create new context with updated message
+              %{body.context | messages: [updated_message | body.context.messages]}
+          end
+
+        updated_body = %{body | message: updated_message, context: updated_context}
+        %{resp | body: updated_body}
+    end
+  end
+
+  defp attach_reasoning_details_to_response(resp, _details), do: resp
 
   defp ensure_parsed_body(body) when is_binary(body) do
     case Jason.decode(body) do
